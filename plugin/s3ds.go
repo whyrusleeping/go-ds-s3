@@ -92,6 +92,23 @@ func (s3p S3Plugin) DatastoreConfigParser() fsrepo.ConfigFromMap {
 			}
 		}
 
+		var restoreMissing bool
+		if v, ok := m["restoreMissing"]; ok {
+			restoreMissing, ok = v.(bool)
+			if !ok {
+				return nil, fmt.Errorf("s3ds: restoreMissing not a boolean")
+			}
+		}
+
+		var defaultTagging *string
+		if v, ok := m["defaultTagging"]; ok {
+			if s, ok := v.(string); !ok {
+				return nil, fmt.Errorf("s3ds: defaultTagging not a string")
+			} else if s != "" {
+				defaultTagging = &s
+			}
+		}
+
 		return &S3Config{
 			cfg: s3ds.Config{
 				Region:         region,
@@ -102,6 +119,8 @@ func (s3p S3Plugin) DatastoreConfigParser() fsrepo.ConfigFromMap {
 				RootDirectory:  rootDirectory,
 				Workers:        workers,
 				RegionEndpoint: endpoint,
+				RestoreMissing: restoreMissing,
+				DefaultTagging: defaultTagging,
 			},
 		}, nil
 	}

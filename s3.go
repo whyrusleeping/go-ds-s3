@@ -20,7 +20,10 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	ds "github.com/ipfs/go-datastore"
 	dsq "github.com/ipfs/go-datastore/query"
+	logging "github.com/ipfs/go-log"
 )
+
+var log = logging.Logger("datastore/s3")
 
 const (
 	// listMax is the largest amount of objects you can request from S3 in a list
@@ -53,6 +56,16 @@ type Config struct {
 	RootDirectory       string
 	Workers             int
 	CredentialsEndpoint string
+
+	// RestoreMissing will attempt to restore missing objects on Get by
+	// checking if the key exist as a deleted versioned object. Note that
+	// there is a substantial overhead for doing this (about x2-x10).
+	RestoreMissing bool
+
+	// DefaultTagging will apply S3 tags to any Put'd object. The tags are
+	// defined as a URL query-encoded key-value string. Useful for defining S3
+	// lifecycle rules based on tags. (E.g. "Key1=Value1&Key2=Value2")
+	DefaultTagging *string
 }
 
 func NewS3Datastore(conf Config) (*S3Bucket, error) {
@@ -102,17 +115,79 @@ func NewS3Datastore(conf Config) (*S3Bucket, error) {
 	}, nil
 }
 
+// Put will create a corresponding object on S3 with the default tagging. Note
+// that calling Put on an object that already exists in S3 will override it and
+// any tagging it already has. Avoid calling Put on keys that already exist
+// correctly.
 func (s *S3Bucket) Put(k ds.Key, value []byte) error {
 	_, err := s.S3.PutObject(&s3.PutObjectInput{
-		Bucket: aws.String(s.Bucket),
-		Key:    aws.String(s.s3Path(k.String())),
-		Body:   bytes.NewReader(value),
+		Bucket:  aws.String(s.Bucket),
+		Key:     aws.String(s.s3Path(k.String())),
+		Body:    bytes.NewReader(value),
+		Tagging: s.DefaultTagging,
 	})
 	return err
 }
 
 func (s *S3Bucket) Sync(prefix ds.Key) error {
 	return nil
+}
+
+func (s *S3Bucket) restoreVersioned(k ds.Key) ([]byte, error) {
+	// Find a deleted marker version, if it exists, so we can remove it and
+	// restore the key.
+	versions, err := s.S3.ListObjectVersions(&s3.ListObjectVersionsInput{
+		Bucket:    aws.String(s.Bucket),
+		KeyMarker: aws.String(s.s3Path(k.String())),
+		MaxKeys:   aws.Int64(2),
+	})
+
+	if err != nil {
+		return nil, ds.ErrNotFound
+	}
+
+	var marker *s3.DeleteMarkerEntry
+	for _, deleteMarker := range versions.DeleteMarkers {
+		if *deleteMarker.IsLatest {
+			marker = deleteMarker
+			break
+		}
+	}
+
+	if marker == nil || len(versions.Versions) == 0 {
+		// No old version found
+		return nil, ds.ErrNotFound
+	}
+
+	go func() {
+		// Delete the delete marker, for next time.
+		// This happens concurrently as the previous version is returned. The
+		// operations are independent of each other.
+		if _, err = s.S3.DeleteObject(&s3.DeleteObjectInput{
+			Bucket:    aws.String(s.Bucket),
+			Key:       aws.String(s.s3Path(k.String())),
+			VersionId: marker.VersionId,
+		}); err != nil {
+			log.Errorf("S3 datastore failed to remove delete marker during restore attempt: %s", err)
+			return
+		}
+	}()
+
+	// Return a recent version
+	resp, err := s.S3.GetObject(&s3.GetObjectInput{
+		Bucket:    aws.String(s.Bucket),
+		Key:       aws.String(s.s3Path(k.String())),
+		VersionId: versions.Versions[0].VersionId,
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return nil, ds.ErrNotFound
+		}
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+	return ioutil.ReadAll(resp.Body)
 }
 
 func (s *S3Bucket) Get(k ds.Key) ([]byte, error) {
@@ -122,7 +197,10 @@ func (s *S3Bucket) Get(k ds.Key) ([]byte, error) {
 	})
 	if err != nil {
 		if isNotFound(err) {
-			return nil, ds.ErrNotFound
+			if !s.Config.RestoreMissing {
+				return nil, ds.ErrNotFound
+			}
+			return s.restoreVersioned(k)
 		}
 		return nil, err
 	}
